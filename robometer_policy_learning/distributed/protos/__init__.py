@@ -76,18 +76,18 @@ def _ensure_generated():
     reward_relabel_pb2_path = here / "reward_relabel_pb2.py"
     reward_relabel_pb2_grpc_path = here / "reward_relabel_pb2_grpc.py"
 
-    generated = [learner_pb2_path, learner_pb2_grpc_path, reward_relabel_pb2_path, reward_relabel_pb2_grpc_path]
-    protos = [here / "learner.proto", here / "reward_relabel.proto"]
-
-    need_generate = False
-    if not all(p.exists() for p in generated):
-        need_generate = True
-    else:
-        proto_mtime = max(p.stat().st_mtime for p in protos if p.exists())
-        for gen in generated:
-            if gen.stat().st_mtime < proto_mtime:
-                need_generate = True
-                break
+    learner_proto = here / "learner.proto"
+    reward_proto = here / "reward_relabel.proto"
+    dependencies = {
+        learner_pb2_path: (learner_proto,),
+        learner_pb2_grpc_path: (learner_proto,),
+        reward_relabel_pb2_path: (learner_proto, reward_proto),
+        reward_relabel_pb2_grpc_path: (learner_proto, reward_proto),
+    }
+    need_generate = any(
+        not output.exists() or any(source.stat().st_mtime > output.stat().st_mtime for source in sources if source.exists())
+        for output, sources in dependencies.items()
+    )
 
     if need_generate:
         _generate_protos()

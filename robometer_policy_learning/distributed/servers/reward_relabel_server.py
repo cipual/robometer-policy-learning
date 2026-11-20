@@ -191,7 +191,7 @@ class RewardRelabelService(pb_grpc.RewardRelabelServiceServicer):
                 text_embedding = None  # Will be computed below
 
         # If we don't have an embedding yet, try to compute from language_instruction
-        if text_embedding is None:
+        if text_embedding is None and (self.sentence_model is not None or self.exp_config.data.load_embeddings):
             if language_instruction and self.sentence_model is not None:
                 # logger.info(f"Computing text embedding from language_instruction string using sentence_model.")
                 text_embedding_tensor = compute_text_embeddings(language_instruction, self.sentence_model)
@@ -825,7 +825,7 @@ class RewardRelabelServer:
                 logger.info(f"Loading sentence transformer model: {sentence_model_name}")
                 sentence_model = SentenceTransformer(sentence_model_name)
                 logger.success("Sentence transformer model loaded successfully")
-            else:
+            elif exp_config.data.load_embeddings:
                 logger.info("No sentence_model specified. Server will require precomputed text embeddings in observations.")
 
             # Add Robometer service

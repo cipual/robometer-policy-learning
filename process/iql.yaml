@@ -1,0 +1,57 @@
+seed: 42
+device: cuda:0
+matmul_precision: highest
+cache_training_images: true
+steps: 30000
+save_every: 1000
+log_every: 20
+val_batch_size: 64
+val_samples: 2048
+reference_hz: 15
+wandb: true
+wandb_project: robometer-policy-learning
+run_name: robometer-261119
+train_replay: work_dirs/debug/robometer-261119/data/train.h5
+train_rewards: work_dirs/debug/robometer-261119/data/train-rewards.h5
+val_replay: work_dirs/debug/robometer-261119/data/val.h5
+val_rewards: work_dirs/debug/robometer-261119/data/val-rewards.h5
+actor:
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 6
+  transformer_dropout: 0.0
+  chunk_size: 1
+  image_encoder_type: impala
+  impala_use_smaller: true
+  impala_output_dim: 128
+  feature_hidden_dims: [512, 512]
+  use_language_embeddings: false
+  use_layer_norm: false
+critic:
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 6
+  transformer_dropout: 0.0
+  chunk_size: 1
+  image_encoder_type: impala
+  impala_use_smaller: true
+  impala_output_dim: 128
+  feature_hidden_dims: [768, 512]
+  use_language_embeddings: false
+  use_layer_norm: true
+  pooling_strategy: first
+iql:
+  batch_size: 256
+  gamma: 0.99
+  tau: 0.005
+  target_update_interval: 1
+  advantage_temp: 0.5  # Upstream multiplies by this value, equivalent to Appendix E.3 beta=2.
+  expectile: 0.7
+  clip_score: 100.0
+  policy_extraction: awr
+  num_critics: 5
+  n_critics_to_sample: 2
+  pooled_critic_features: true
+  actor_optimizer_lr: 0.0003
+  critic_optimizer_lr: 0.0003
+  v_net_optimizer_lr: 0.0003
