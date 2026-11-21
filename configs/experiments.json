@@ -1,0 +1,237 @@
+{
+  "format": "experiment_declaration_v1",
+  "work_dir": "work_dirs",
+  "experiments": {
+    "iql_eval": {
+      "completion": {
+        "evaluation_steps": [
+          "evaluate"
+        ],
+        "required_files": {
+          "assets": [
+            "outputs/assets/integrity.json"
+          ],
+          "replay": [
+            "outputs/replay/report.json"
+          ],
+          "observation": [
+            "outputs/observation/report.json"
+          ],
+          "evaluate": [
+            "outputs/evaluate/test/vis/robometer_iql_step_3000/episodes/raw/meta/episodes.jsonl"
+          ]
+        },
+        "summary_file": "README.md"
+      },
+      "steps": {
+        "assets": {
+          "depends_on": [],
+          "config_file": "config/assets.json",
+          "files": {
+            "config/assets.json": "${configs.assets}"
+          },
+          "commands": {
+            "run": [
+              "${python}",
+              "process/00_check_assets.py",
+              "--config",
+              "${step_dir}/config/assets.json"
+            ]
+          }
+        },
+        "replay": {
+          "depends_on": [
+            "assets"
+          ],
+          "config_file": "config/replay.json",
+          "files": {
+            "config/replay.json": "${configs.replay}"
+          },
+          "commands": {
+            "run": [
+              "${python}",
+              "-m",
+              "process.probe_iql",
+              "--config",
+              "${step_dir}/config/replay.json"
+            ]
+          }
+        },
+        "observation": {
+          "depends_on": [
+            "replay"
+          ],
+          "config_file": "config/observation.json",
+          "files": {
+            "config/observation.json": "${configs.observation}"
+          }
+        },
+        "evaluate": {
+          "depends_on": [
+            "observation"
+          ],
+          "config_file": "config/evaluate.json",
+          "files": {
+            "config/evaluate.json": "${configs.evaluate}"
+          },
+          "commands": {
+            "run": [
+              "${python}",
+              "-m",
+              "process.eval_iql",
+              "--config",
+              "${step_dir}/config/evaluate.json"
+            ]
+          }
+        }
+      }
+    },
+    "dsrl_online": {
+      "completion": {
+        "evaluation_steps": [
+          "evaluate"
+        ],
+        "required_files": {
+          "assets": [
+            "outputs/assets/integrity.json"
+          ],
+          "reward": [
+            "outputs/reward/report.json"
+          ],
+          "smoke": [
+            "outputs/smoke/report.json"
+          ],
+          "train": [
+            "outputs/train/training_summary.json"
+          ],
+          "evaluate": [
+            "outputs/evaluate/test/summary.json"
+          ]
+        },
+        "summary_file": "README.md"
+      },
+      "steps": {
+        "assets": {
+          "depends_on": [],
+          "config_file": "config/assets.json",
+          "files": {
+            "config/assets.json": "${configs.assets}"
+          },
+          "commands": {
+            "run": [
+              "${python}",
+              "process/00_check_assets.py",
+              "--config",
+              "${step_dir}/config/assets.json"
+            ]
+          }
+        },
+        "reward": {
+          "depends_on": [
+            "assets"
+          ],
+          "config_file": "config/reward.json",
+          "files": {
+            "config/reward.json": "${configs.reward}",
+            "config/vla.json": "${configs.vla}",
+            "config/service_probe.json": "${configs.service_probe}"
+          },
+          "commands": {
+            "run": [
+              "/mnt/data/VLA-RL/r1lite_robometer/.venv/bin/python",
+              "-m",
+              "process.serve_reward",
+              "--config",
+              "${step_dir}/config/reward.json"
+            ],
+            "vla": [
+              "env",
+              "-u",
+              "LD_LIBRARY_PATH",
+              "PYTHONFAULTHANDLER=1",
+              "${python}",
+              "-m",
+              "process.serve_frozen_vla",
+              "--config",
+              "${step_dir}/config/vla.json"
+            ],
+            "probe": [
+              "${python}",
+              "-m",
+              "process.probe_dsrl",
+              "--config",
+              "${step_dir}/config/service_probe.json"
+            ]
+          }
+        },
+        "smoke": {
+          "depends_on": [
+            "assets",
+            "reward"
+          ],
+          "config_file": "config/smoke.json",
+          "files": {
+            "config/smoke.json": "${configs.smoke}",
+            "config/benchmark.json": "${configs.benchmark}"
+          },
+          "commands": {
+            "run": [
+              "${python}",
+              "-m",
+              "process.smoke_dsrl",
+              "--config",
+              "${step_dir}/config/smoke.json"
+            ],
+            "benchmark": [
+              "env",
+              "-u",
+              "LD_LIBRARY_PATH",
+              "${python}",
+              "-m",
+              "process.benchmark_dsrl",
+              "--config",
+              "${step_dir}/config/benchmark.json"
+            ]
+          }
+        },
+        "train": {
+          "depends_on": [
+            "smoke"
+          ],
+          "config_file": "config/train.json",
+          "files": {
+            "config/train.json": "${configs.train}"
+          },
+          "commands": {
+            "run": [
+              "env",
+              "-u",
+              "LD_LIBRARY_PATH",
+              "${python}",
+              "-m",
+              "process.online_dsrl",
+              "--config",
+              "${step_dir}/config/train.json"
+            ],
+            "client": [
+              "${python}",
+              "-m",
+              "process.start_dsrl_client",
+              "--config",
+              "${step_dir}/config/train.json"
+            ]
+          }
+        },
+        "evaluate": {
+          "depends_on": [
+            "train"
+          ],
+          "config_file": "config/evaluate.json",
+          "files": {
+            "config/evaluate.json": "${configs.evaluate}"
+          }
+        }
+      }
+    }
+  }
+}

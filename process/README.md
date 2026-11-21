@@ -47,16 +47,40 @@ CUDA_VISIBLE_DEVICES="$iql_gpu" .venv/bin/python -m process.train_iql \
 
 ## 2. 工作站在线 DSRL
 
-奖励进程从 `../robometer/process/serve_reward.sh` 启动，初始分卡为一张 48 GB 卡跑 Robometer 奖励，另一张给冻结的 VLA 推理和 DSRL 更新。记录实际显存峰值和奖励请求延迟。采集进程将回合转换送入 replay，奖励请求可在回合内异步提交，并在结束时补齐。论文使用 success head 提前结束回合或切换阶段时，需要将该输出接入控制循环。
+当前候选为 `work_dirs/debug/dsrl-online-261120/`，完整计划、普通配置、预算、测量与审批状态见其 README。IQL 后续评测已取消，原始记录保留在 `iql-eval-261120/`。
 
-`serve_frozen_vla.py` 在 EVA-VLA-R1lite 的独立环境里加载冻结的 JAX OpenPI checkpoint，通过 loopback 暴露 VLM 特征和显式噪声采样。`--dino-model` 接受本地 DINOv2-small，并输出左腕特征。R1 Lite checkpoint 的模型 horizon 由服务返回。`r1lite_dsrl.py` 复用官方 SAC 和 Transformer 噪声 actor，将 8×32 的噪声重复到模型 horizon，执行侧只消费前 8 条动作。回合收集的前视帧通过 gRPC 异步重标，单阶段每步奖励为绝对 progress 加步惩罚，成功步取消惩罚。
+工作站使用三个独立进程：本项目根 `.venv` 提供冻结 JAX VLA 与 DSRL learner，同级 `../r1lite_robometer/.venv` 提供冻结第100步奖励，`../DenseRL/.venv` 运行内置 EVA client。不得混装环境。全部原生入口显式传入本轮配置；下面命令只有非运动检查可在未获正式批准时执行。
 
 ```bash
-cd ../EVA-VLA-R1lite
-XLA_PYTHON_CLIENT_PREALLOCATE=false CUDA_VISIBLE_DEVICES="$vla_gpu" \
-    .venv/bin/python ../robometer-policy-learning/process/serve_frozen_vla.py \
-    --config "$openpi_config" --checkpoint "$frozen_vla_checkpoint" \
-    --dino-model "$dino_snapshot" --port 18100
+# 冻结奖励服务；只监听 localhost，不连接机器人
+../r1lite_robometer/.venv/bin/python -m process.serve_reward --config "$RUN/config/reward.json"
+# 冻结 VLA 服务；XLA_FLAGS 来自普通配置
+env -u LD_LIBRARY_PATH .venv/bin/python -m process.serve_frozen_vla --config "$RUN/config/vla.json"
+# 录制回放校验并完成编译热身；不发送动作
+.venv/bin/python -m process.probe_dsrl --config "$RUN/config/service_probe.json"
+# 两个小规模 SAC 更新及保存恢复；不连接机器人
+.venv/bin/python -m process.smoke_dsrl --config "$RUN/config/smoke.json"
+# 正式网络形状的两个合成 replay 更新；不初始化正式训练
+env -u LD_LIBRARY_PATH .venv/bin/python -m process.benchmark_dsrl --config "$RUN/config/benchmark.json"
+# 以下两个入口仅在正式训练与真机运动均获明确批准后启动
+env -u LD_LIBRARY_PATH .venv/bin/python -m process.online_dsrl --config "$RUN/config/train.json"
+.venv/bin/python -m process.start_dsrl_client --config "$RUN/config/train.json"
 ```
 
-在策略仓库用 `process.smoke_dsrl --vla-port 18100` 串联冻结的 VLA、录制回放、奖励服务和 SAC 更新。真实工作站用 EVA 控制、前视帧和回合事件调用同一组接口。上游 [真机入口](../scripts/train_dsrl.py) 的现成配置使用 DROID 协议。R1 Lite 执行进程需在工作站交付并按实际控制频率、关节标定和终止事件调试。
+`RUN` 指本轮实验绝对路径；`.manager/commands/` 仅记录上述命令和 tee 日志。人类与 agent 使用相同入口。恢复 learner 在原命令后加 `--resume` 并指定本轮产生的 checkpoint，继续原 W&B run ID；不能用工程冒烟权重初始化在线学习。
+
+用户确认43条完整 PackTask 轨迹，人工停止、评分与复位；每条轨迹及最终评测保留三路视频和动作。DSRL actor/critic 从头学习8×32扩散噪声，重复到冻结模型H10并执行前8条绝对qpos。输入为state14、左腕DINO384、末token VLM2048；不是关节残差，也不混用Dense的阶段/融合目标。
+
+EVA 同源观测经专用RPC送入 learner；发布返回、后继观测、人工评分及原生保存成功共同决定是否能入 replay。噪声 chunk 末端的冻结 progress 减一步惩罚，人工整任务成功仅在末 chunk 加配置中的成功项；success head单独落盘，不作自动终止。SAC 折扣、warmup和更新比的单位均在本轮方案说明，实际值由 train.json 唯一控制。
+
+同步执行的块内参考为15Hz，块边界包含真实特征/采样耗时；上机前必须先完成回放热身，不能把冷编译塞入运动回合。源时钟和真实发布事实保留，不插补训练credit。Console端的Setup、START、停止和复位由现场操作者执行；不得自动homing。ROS反馈短程通过不等于发布长阻塞已修复。
+
+训练视频/动作在 `outputs/train/trajectories/dsrl_online/episodes/raw/`，人工评分唯一来源为其中 `meta/episodes.jsonl`。精确控制源与chunk/reward在 `outputs/train/replay/<episode_id>/`；checkpoint在 `outputs/train/ckpt/`，不默认清理。最终固定策略评测在同一候选后续配置，预算和权重尚待确认，不把在线训练轨迹作为固定策略最终成功率。
+
+工作站当前训练入口打开RL tab，原生成功/失败保存按钮以0/1标记整任务；EVAL仅用于训练完成后的13条固定策略评测。Setup验证不创建训练episode，不消费轨迹预算。
+
+冻结 VLA 的 `prepare` 返回特征和一次性 context ID，`sample_prepared` 只传该 ID 与 actor 噪声，复用同源前缀/KV，不重复传三路图像。CPU DINO 与 JAX 前缀异步执行重叠；全部冷编译在回放 probe 内完成。诊断报告区分模型内部、回环 RPC 与真机源/发布/录制开销，不能把回环吞吐宣称为真机 RTC。
+
+当前用户指定夹爪来源为冻结VLA：`action_control`声明固定标准高斯噪声种子。同一context的paired解码返回`actions`（DSRL提议）和`baseline_actions`，R1LiteDSRL组合12个机械臂关节与baseline的第6/13通道；Native阈值二值化后仍经实际发布反馈核验。源记录保存两路提议、baseline噪声、组合动作及逐步真实命令；不屏蔽扩散噪声的第6/13维。历史全DSRL replay保留但不加入新动作映射的训练buffer。
+
+当前 DSRL 在线路径使用 DenseRL 原生 H50/prefix5/H8：`serve_frozen_vla --config` 按显式 runtime_python 运行独立冻结服务；`online_dsrl --config ... --resume ...` 在本项目环境运行 learner；`start_dsrl_client --config ...` 复用 DenseExecution 与三路录制。`dsrl_strategy` 仅接原生实际源时钟/发布反馈，慢预取使用独立连接。前256个有效已奖励转移走独立完整高斯 warmup，Setup不消耗其RNG。已承诺prefix纳入rtc_prefix71，折扣单位仍为实际8步。真实Setup/START/人工复位由操作者发起。

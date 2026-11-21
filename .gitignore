@@ -36,3 +36,6 @@ checkpoints/*
 extracted_episodes*
 replay_buffer/*
 replay_buffers/*
+
+# Independent local experiment tooling
+/tool/agent-manager/

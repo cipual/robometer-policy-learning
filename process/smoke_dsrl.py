@@ -1,93 +1,138 @@
-"""Exercise the DSRL noise, real reward RPC, replay, and SAC update without robot motion."""
+"""Check DSRL noise, reward backfill, SAC and exact resume without robot motion.
+
+Input: --config with recorded RGB/qpos, explicit fixture/RPC choices and a tiny
+learner budget. Output: an engineering report and an owned checkpoint; proposed
+noise actions are never executed and this replay is not online training data.
+"""
 
 import argparse
+from contextlib import ExitStack
 import json
 from pathlib import Path
+import random
+import time
 
-import h5py
+import cv2
 import numpy as np
+import pyarrow.parquet as pq
 import torch
 
 from process.r1lite_dsrl import NoiseTransition, R1LiteDSRL
 from process.reward_client import RewardClient
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--replay", type=Path, required=True)
-    parser.add_argument("--episode", required=True)
-    parser.add_argument("--address", default="127.0.0.1:50052")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--vla-port", type=int, help="Use the local frozen OpenPI service in place of the fixture")
-    args = parser.parse_args()
-    config = {"features": {"state": 14, "dino_wrist": 384, "vlm_features": 2048}, "capacity": 16,
-              "noise_bound": 2.0, "noise_dim": 32, "chunk_size": 8, "model_horizon": 10,
-              "success_threshold": 0.6, "reward_batch_size": 2,
-              "actor": {"d_model": 32, "nhead": 4, "num_encoder_layers": 1, "feature_hidden_dims": [32]},
-              "critic": {"d_model": 32, "nhead": 4, "num_encoder_layers": 1, "feature_hidden_dims": [32],
-                         "action_embedding_dim": 32, "pooling_strategy": "first"},
-              "sac": {"gamma": 0.995, "learning_starts": 0, "batch_size": 2, "target_entropy": 0,
-                      "num_critic_updates_per_actor_update": 1, "train_actor_with_kl_divergence": False}}
-    torch.manual_seed(42)
+class FixtureReward:
+    def predict(self, frames, indices, task, episode_id):
+        return np.asarray(indices, np.float32) / max(len(frames), 1), np.zeros(len(indices), np.float32)
 
-    def frozen_fixture(obs, *, noise):
-        assert noise.shape == (10, 32)
-        np.testing.assert_array_equal(noise[8:], noise[:2])
-        # A fixed local fixture verifies transport and never connects to a robot or a real VLA.
-        return {"actions": obs["state"][None] + noise[:, :14] * 0.01}
+
+def smoke(config_path):
+    cfg = json.loads(config_path.read_text())
+    random.seed(cfg['seed'])
+    np.random.seed(cfg['seed'])
+    torch.manual_seed(cfg['seed'])
+    torch.set_num_threads(cfg['torch_num_threads'])
+    learner = cfg['learner']
+    steps = 2 * learner['chunk_size']
+    rows = pq.read_table(cfg['parquet']).to_pylist()[:steps + 1]
+    if len(rows) != steps + 1:
+        raise ValueError('The engineering replay needs two complete chunks')
+    frames = {}
+    for camera, path in cfg['videos'].items():
+        capture = cv2.VideoCapture(path)
+        try:
+            values = []
+            for _ in rows:
+                ok, frame = capture.read()
+                if not ok:
+                    raise ValueError(f'Incomplete recorded video: {camera}')
+                values.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frames[camera] = np.asarray(values)
+        finally:
+            capture.release()
+
+    def observation(step):
+        return {'state': np.asarray(rows[step]['observations.state.qpos'], np.float32),
+                'images': {key: value[step] for key, value in frames.items()}, 'prompt': cfg['task']}
+
+    def fixture(obs, *, noise, baseline_noise):
+        if noise.shape != (learner['model_horizon'], learner['noise_dim']):
+            raise ValueError('Fixture received the wrong diffusion noise shape')
+        return {'actions': obs['state'][None] + noise[:8, :14] * 0.01,
+                'baseline_actions': obs['state'][None] + baseline_noise[:8, :14] * 0.01}
 
     vla = None
-    if args.vla_port is not None:
+    if cfg['vla_port'] is not None:
         from process.frozen_vla_client import FrozenVLAClient
+        vla = FrozenVLAClient(cfg['vla_host'], cfg['vla_port'])
+        if (learner['model_horizon'], learner['noise_dim']) != (vla.metadata['model_horizon'], vla.metadata['noise_dim']):
+            raise ValueError('Smoke configuration disagrees with frozen VLA')
 
-        vla = FrozenVLAClient("127.0.0.1", args.vla_port)
-        config["model_horizon"] = vla.metadata["model_horizon"]
-        config["noise_dim"] = vla.metadata["noise_dim"]
-        if not vla.metadata["dino_model"]:
-            config["features"].pop("dino_wrist")
+    def features(step):
+        obs = observation(step)
+        if vla is not None:
+            return vla.features(obs)
+        return {key: obs['state'] if key == 'state' else np.zeros(size, np.float32)
+                for key, size in learner['features'].items()}
 
-    with h5py.File(args.replay, "r") as replay, RewardClient(args.address) as client:
-        episode = replay["data"][args.episode]
-        task = episode["language_instruction"].asstr()[()]
-        frames = episode["frames/cam_high"][:17]
-        states = episode["frames/state"][:17]
-        if len(frames) != 17:
-            raise ValueError("The smoke replay must contain at least 16 transitions")
-        with R1LiteDSRL(vla.infer if vla is not None else frozen_fixture, client, config, args.device) as agent:
-            before = next(agent.algorithm.actor.parameters()).detach().clone()
-            transitions = []
-            features = {"state": states[0], "dino_wrist": np.zeros(384, dtype=np.float32),
-                        "vlm_features": np.zeros(2048, dtype=np.float32)}
-            def observation(step, state):
-                cameras = ("cam_high", "cam_left_wrist", "cam_right_wrist")
-                return {"images": {key: episode["frames"][key][step] for key in cameras}, "state": state, "prompt": task}
-
-            current = observation(0, states[0])
+    output = Path(cfg['output'])
+    output.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as stack:
+        reward = (stack.enter_context(RewardClient(cfg['reward_address'], timeout=cfg['reward_timeout_s'],
+                                                  context_frames=cfg['reward_context_frames']))
+                  if cfg['reward_address'] is not None else FixtureReward())
+        agent = stack.enter_context(R1LiteDSRL(vla.infer if vla else fixture, reward, learner, cfg['device']))
+        transitions = []
+        for start in range(0, steps, learner['chunk_size']):
+            stop = start + learner['chunk_size']
             if vla is not None:
-                features = vla.features(current)
-            for start in (0, 8):
-                proposed, noise = agent.select_chunk(current, features)
-                current = observation(start + 8, proposed[-1])
-                successor = vla.features(current) if vla is not None else {**features, "state": proposed[-1]}
-                transitions.append(NoiseTransition(features, noise, successor, list(range(start + 1, start + 9)),
-                                                   done=False, truncated=start == 8, success=False))
-                features = successor
-            success = agent.succeeded(frames, task, args.episode)
-            agent.submit_episode(frames, transitions, task, args.episode)
-            assert agent.collect_rewards(wait=True) == len(transitions)
-            metrics = {key: float(value) for key, value in agent.train_after_episode(16).items()}
+                current_features, context_id = vla.prepare(observation(start))
+                vla_input = {'dsrl_context_id': context_id}
+            else:
+                current_features, vla_input = features(start), observation(start)
+            actions, noise, proposals = agent.select_chunk(vla_input, current_features, warmup=True)
+            np.testing.assert_array_equal(actions, proposals['baseline_actions'])
+            transitions.append(NoiseTransition(current_features, noise, features(stop),
+                                               list(range(start + 1, stop + 1)), False, stop == steps, False))
+        agent.submit_episode(frames['cam_high'], transitions, cfg['task'], cfg['episode_id'])
+        if agent.collect_rewards(wait=True) != 2:
+            raise ValueError('Reward backfill did not produce two chunks')
+        times = []
+        all_metrics = []
+        for _ in range(2):
+            started = time.perf_counter()
+            metrics = {key: float(value) for key, value in agent.train_after_episode(steps).items()}
             if not metrics or not np.isfinite(list(metrics.values())).all():
-                raise ValueError("The local SAC update did not return finite losses")
-            assert not torch.equal(before, next(agent.algorithm.actor.parameters()))
-            args.output.mkdir(parents=True, exist_ok=False)
-            torch.save(agent.algorithm.actor.state_dict(), args.output / "noise_actor.pt")
-            (args.output / "smoke.json").write_text(json.dumps({"transitions": len(transitions), "metrics": metrics,
-                                                                "success_query": success, "config": config,
-                                                                "vla": vla.metadata if vla is not None else "fixture"},
-                                                               indent=2) + "\n")
-            print(f"Verified {len(transitions)} relabeled chunks and one SAC update")
+                raise ValueError('Non-finite or missing SAC metrics')
+            times.append((time.perf_counter() - started) * 1000)
+            all_metrics.append(metrics)
+            if len(times) == 1:
+                agent.save_checkpoint(output / 'ckpt/engineering-resume.pt', environment_steps=steps, episodes=1)
+        expected = {key: value.detach().clone() for key, value in agent.algorithm.actor.state_dict().items()}
+        restored = stack.enter_context(R1LiteDSRL(vla.infer if vla else fixture, reward, learner, cfg['device']))
+        counters = restored.load_checkpoint(output / 'ckpt/engineering-resume.pt')
+        resumed_metrics = {key: float(value) for key, value in restored.train_after_episode(steps).items()}
+        for key, value in restored.algorithm.actor.state_dict().items():
+            torch.testing.assert_close(value, expected[key], rtol=0, atol=cfg['resume_atol'])
+        loss_keys = [key for key in all_metrics[-1] if 'loss' in key]
+        for key in loss_keys:
+            np.testing.assert_allclose(resumed_metrics[key], all_metrics[-1][key], rtol=0, atol=cfg['resume_atol'])
+        report = {'format': 'r1lite_dsrl_smoke_v1', 'robot_connected': False, 'online_training_data': False,
+                  'vla_backend': vla.metadata if vla else 'fixture',
+                  'action_control': cfg['action_control'],
+                  'reward_backend': cfg['reward_address'] or 'fixture', 'transitions': 2,
+                  'updates_before_save': counters['updates'], 'restored_counters': counters,
+                  'resume_actor_and_loss_match': True, 'update_ms': times, 'metrics': all_metrics,
+                  'scope': 'Two tiny SAC updates plus replay of the second update after resume. Recorded next states are engineering fixtures, not outcomes of the proposed DSRL actions.'}
+        (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+        print(output / 'report.json', flush=True)
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, required=True)
+    smoke(parser.parse_args().config.resolve())
+
+
+if __name__ == '__main__':
     main()

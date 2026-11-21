@@ -12,7 +12,7 @@ from robometer_policy_learning.distributed.protos import learner_pb2, reward_rel
 
 
 class RewardClient:
-    def __init__(self, address, timeout=60, max_msg_mb=256):
+    def __init__(self, address, timeout=60, max_msg_mb=256, context_frames=None):
         limit = max_msg_mb * 1024 * 1024
         self.channel = grpc.insecure_channel(address, options=[
             ("grpc.enable_http_proxy", 0), ("grpc.max_send_message_length", limit),
@@ -20,6 +20,7 @@ class RewardClient:
         ])
         self.stub = reward_relabel_pb2_grpc.RewardRelabelServiceStub(self.channel)
         self.timeout = timeout
+        self.context_frames = context_frames
 
     def __enter__(self):
         return self
@@ -31,6 +32,25 @@ class RewardClient:
         indices = [int(index) for index in indices]
         if not indices or any(index < 0 or index >= len(frames) for index in indices) or not task:
             raise ValueError("A task and valid frame indices are required")
+        if self.context_frames is not None:
+            if self.context_frames < 1:
+                raise ValueError("Reward context length must be positive")
+            # Match Robometer's prefix subsampling exactly, without sending an
+            # ever-growing full RGB episode through a bounded gRPC message.
+            results = []
+            for index in indices:
+                if index + 1 <= self.context_frames:
+                    selected = range(index + 1)
+                elif self.context_frames == 1:
+                    selected = [index]
+                else:
+                    selected = np.rint(np.linspace(0, index, self.context_frames)).astype(int)
+                clip = [frames[int(i)] for i in selected]
+                results.append(self._predict(clip, [len(clip) - 1], task, episode_id, camera))
+            return np.concatenate(results, axis=1)
+        return self._predict(frames, indices, task, episode_id, camera)
+
+    def _predict(self, frames, indices, task, episode_id, camera):
         transitions = []
         for frame in frames:
             buffer = BytesIO()
